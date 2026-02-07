@@ -1,16 +1,11 @@
-# Data files (too large and should be obtained from source)
+# Contains PAT token!
+push_to_github.sh
+PUSH_INSTRUCTIONS.md
+
+# Raw data files (too large, obtain from source)
 data/
-*.csv
 *.xlsx
 *.xls
-
-# Results and outputs (generated files)
-results/
-figures/
-reports/
-*.png
-*.jpg
-*.pdf
 
 # Python
 __pycache__/
@@ -41,6 +36,9 @@ venv/
 ENV/
 env/
 .venv
+
+# Claude Code settings (private)
+.claude/
 
 # IDE
 .vscode/

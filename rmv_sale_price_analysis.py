@@ -6,6 +6,7 @@ This script performs statistical analysis to determine if county-assessed
 Real Market Values correlate properly with actual sale prices.
 """
 
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,62 +14,139 @@ import seaborn as sns
 from scipy import stats
 from datetime import datetime, timedelta
 
-def load_marion_county_data(filepath):
+def load_orcats_data(filepath):
     """
-    Load Marion County (Salem) sales data from CSV
-    
-    Expected columns will vary - inspect the CSV to determine exact column names
-    Common columns: Account, SaleDate, SalePrice, RMV, etc.
+    Load Marion County ORCATS999 comprehensive assessment data.
+
+    Key columns:
+        RMVLAND, RMVIMPR - Real Market Value components
+        ACCOUNT_ID - Account number for joining with sales data
+        SITUSCITY - City name
+        PCLS - Property class code (101-199 = residential)
+    """
+    df = pd.read_csv(filepath, dtype={'RMVLAND': str, 'RMVIMPR': str})
+    print(f"Loaded {len(df):,} total property records")
+
+    # Convert RMV columns
+    for col in ['RMVLAND', 'RMVIMPR', 'AV']:
+        df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+
+    # Calculate total RMV
+    df['RMV'] = df['RMVLAND'].fillna(0) + df['RMVIMPR'].fillna(0)
+
+    return df
+
+
+def load_sales_data(*filepaths):
+    """
+    Load Marion County sales CSV files and combine them.
+
+    The sales CSVs have Condition Code which lets us filter to
+    confirmed arms-length transactions (code 33).
+    """
+    frames = []
+    for fp in filepaths:
+        df = pd.read_csv(fp)
+        print(f"  Loaded {len(df):,} rows from {os.path.basename(fp)}")
+        frames.append(df)
+    combined = pd.concat(frames, ignore_index=True)
+    print(f"  Combined: {len(combined):,} total sale records")
+    return combined
+
+
+def prepare_salem_data(orcats_df, sales_df):
+    """
+    Join sales data with assessment data to get RMV + validated sale prices.
+
+    Strategy:
+        1. Filter sales to Condition Code 33 (confirmed arms-length sales)
+        2. Filter sales to Salem residential addresses
+        3. Join with ORCATS999 on Account Number to get RMV values
+        4. Apply price range filters
+    """
+    print("\n--- Preparing Salem data ---")
+
+    # --- Clean up sales data ---
+    # Parse Sale Price (has commas)
+    sales_df['SalePrice'] = pd.to_numeric(
+        sales_df['Sale Price'].astype(str).str.replace(',', ''), errors='coerce'
+    )
+    sales_df['SaleDate'] = pd.to_datetime(sales_df['Sale Date'], errors='coerce')
+
+    # Condition Code 33 = Confirmed Sale (arms-length, open market)
+    sales_df['Condition Code'] = pd.to_numeric(sales_df['Condition Code'], errors='coerce')
+    confirmed = sales_df[sales_df['Condition Code'] == 33].copy()
+    print(f"  Confirmed sales (code 33): {len(confirmed):,} of {len(sales_df):,}")
+
+    # Filter to residential (Property Class starts with 1)
+    confirmed['PropClassNum'] = pd.to_numeric(confirmed['Property Class'], errors='coerce')
+    confirmed = confirmed[(confirmed['PropClassNum'] >= 100) & (confirmed['PropClassNum'] < 200)]
+    print(f"  Residential confirmed sales: {len(confirmed):,}")
+
+    # Filter to Salem via Situs Address
+    confirmed['SitusUpper'] = confirmed['Situs Address'].astype(str).str.upper()
+    salem_sales = confirmed[confirmed['SitusUpper'].str.contains('SALEM', na=False)].copy()
+    print(f"  Salem residential sales: {len(salem_sales):,}")
+
+    # Deduplicate - keep one row per Sale ID (multi-account sales repeat)
+    salem_sales = salem_sales.drop_duplicates(subset='Sale ID', keep='first')
+    print(f"  After dedup (unique sales): {len(salem_sales):,}")
+
+    # --- Join with ORCATS for RMV ---
+    # Clean account numbers for joining
+    salem_sales['Account Number'] = pd.to_numeric(
+        salem_sales['Account Number'], errors='coerce'
+    )
+    orcats_df['ACCOUNT_ID_NUM'] = pd.to_numeric(
+        orcats_df['ACCOUNT_ID'], errors='coerce'
+    )
+
+    merged = salem_sales.merge(
+        orcats_df[['ACCOUNT_ID_NUM', 'RMVLAND', 'RMVIMPR', 'RMV', 'AV']].drop_duplicates('ACCOUNT_ID_NUM'),
+        left_on='Account Number',
+        right_on='ACCOUNT_ID_NUM',
+        how='inner'
+    )
+    print(f"  Matched with assessment data: {len(merged):,}")
+
+    # --- Final cleaning ---
+    df = merged[(merged['SalePrice'] > 0) & (merged['RMV'] > 0)].copy()
+    df = df[(df['SalePrice'] >= 50000) & (df['SalePrice'] <= 5000000)]
+    df = df[(df['RMV'] >= 50000) & (df['RMV'] <= 5000000)]
+    print(f"  After price range filter ($50k-$5M): {len(df):,}")
+
+    return df
+
+def load_gresham_data(filepath, exclude_new_construction=False):
+    """
+    Load Gresham research database CSV (produced by gresham_data_collector.py).
+    Filters to records with valid SalePrice and RMV in the $50k-$5M range.
+    Optionally excludes new construction (YearBuilt >= 2024) whose RMV
+    reflects land-only assessments before the home was completed.
     """
     df = pd.read_csv(filepath)
-    
-    # Print column names to help identify the right fields
-    print("Marion County Columns:", df.columns.tolist())
-    
+    df['SaleDate'] = pd.to_datetime(df['SaleDate'], errors='coerce')
+    for col in ['SalePrice', 'RMV', 'RMVLAND', 'RMVIMPR']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['YearBuilt'] = pd.to_numeric(df['YearBuilt'], errors='coerce')
+
+    print(f"\n--- Preparing Gresham data ---")
+    print(f"  Total records in research DB: {len(df)}")
+
+    df = df[(df['SalePrice'] > 0) & (df['RMV'] > 0)].copy()
+    df = df[(df['SalePrice'] >= 50000) & (df['SalePrice'] <= 5000000)]
+    df = df[(df['RMV'] >= 50000) & (df['RMV'] <= 5000000)]
+    print(f"  Valid prices ($50k-$5M): {len(df)}")
+
+    if exclude_new_construction:
+        before = len(df)
+        df = df[df['YearBuilt'] < 2024].copy()
+        excluded = before - len(df)
+        print(f"  Excluded new construction (built 2024+): {excluded} removed, {len(df)} remain")
+
+    print(f"  Analysis-ready: {len(df)}")
     return df
 
-def filter_recent_sales(df, months=12, date_column='SaleDate'):
-    """
-    Filter to sales within the last N months
-    """
-    # Convert date column to datetime
-    df[date_column] = pd.to_datetime(df[date_column], errors='coerce')
-    
-    # Calculate cutoff date
-    cutoff_date = datetime.now() - timedelta(days=months*30)
-    
-    # Filter
-    recent = df[df[date_column] >= cutoff_date].copy()
-    
-    print(f"Found {len(recent)} sales in the last {months} months")
-    
-    return recent
-
-def clean_sales_data(df, sale_price_col='SalePrice', rmv_col='RMV', city_filter=None):
-    """
-    Clean the sales data:
-    - Remove non-arms-length transactions
-    - Remove outliers
-    - Filter to specific city if needed
-    """
-    # Remove zeros and nulls
-    df = df[(df[sale_price_col] > 0) & (df[rmv_col] > 0)].copy()
-    
-    # Remove extreme outliers (likely data errors)
-    # Keep sales between $50k and $5M
-    df = df[(df[sale_price_col] >= 50000) & (df[sale_price_col] <= 5000000)]
-    df = df[(df[rmv_col] >= 50000) & (df[rmv_col] <= 5000000)]
-    
-    # Filter to specific city if provided
-    if city_filter:
-        if 'City' in df.columns:
-            df = df[df['City'].str.upper() == city_filter.upper()]
-        elif 'MailingCity' in df.columns:
-            df = df[df['MailingCity'].str.upper() == city_filter.upper()]
-    
-    print(f"After cleaning: {len(df)} valid sales remain")
-    
-    return df
 
 def calculate_statistics(df, sale_price_col='SalePrice', rmv_col='RMV'):
     """
@@ -156,7 +234,7 @@ def create_visualizations(df, city_name, sale_price_col='SalePrice', rmv_col='RM
     
     # 3. Box plot of ratios
     ax3 = axes[1, 0]
-    ax3.boxplot([df['Ratio']], labels=[city_name])
+    ax3.boxplot([df['Ratio']], tick_labels=[city_name])
     ax3.axhline(y=1.0, color='red', linestyle='--', linewidth=2, label='Perfect Match')
     ax3.set_ylabel('Sale Price / RMV Ratio', fontsize=12)
     ax3.set_title('Distribution of Sale Price to RMV Ratios', fontsize=14)
@@ -267,68 +345,313 @@ def compare_cities(gresham_stats, salem_stats):
     print("\n" + "="*70)
     print("COMPARATIVE ANALYSIS: GRESHAM VS. SALEM")
     print("="*70)
-    
-    print("\nCORRELATION COMPARISON:")
-    print(f"  Gresham R²: {gresham_stats['R_Squared']:.4f}")
-    print(f"  Salem R²:   {salem_stats['R_Squared']:.4f}")
-    
-    if gresham_stats['R_Squared'] > salem_stats['R_Squared']:
-        print(f"  → Gresham has BETTER correlation (difference: {gresham_stats['R_Squared'] - salem_stats['R_Squared']:.4f})")
-    else:
-        print(f"  → Salem has BETTER correlation (difference: {salem_stats['R_Squared'] - gresham_stats['R_Squared']:.4f})")
-    
-    print("\nPREDICTION ACCURACY COMPARISON:")
-    print(f"  Gresham Median % Diff: {gresham_stats['Median_Percent_Diff']:.2f}%")
-    print(f"  Salem Median % Diff:   {salem_stats['Median_Percent_Diff']:.2f}%")
-    
+
+    metrics = [
+        ('Sample Size', 'Count', '{:,}', '{:,}'),
+        ('Correlation (r)', 'Correlation', '{:.4f}', '{:.4f}'),
+        ('R-Squared', 'R_Squared', '{:.4f}', '{:.4f}'),
+        ('Median % Diff', 'Median_Percent_Diff', '{:.2f}%', '{:.2f}%'),
+        ('Mean Ratio', 'Mean_Ratio', '{:.3f}', '{:.3f}'),
+        ('Regression Slope', 'Regression_Slope', '{:.4f}', '{:.4f}'),
+        ('Median Sale Price', 'Median_Sale_Price', '${:,.0f}', '${:,.0f}'),
+        ('Median RMV', 'Median_RMV', '${:,.0f}', '${:,.0f}'),
+    ]
+
+    print(f"\n  {'Metric':<25} {'Gresham':>15} {'Salem':>15}")
+    print(f"  {'-'*25} {'-'*15} {'-'*15}")
+    for label, key, gfmt, sfmt in metrics:
+        gval = gfmt.format(gresham_stats[key])
+        sval = sfmt.format(salem_stats[key])
+        print(f"  {label:<25} {gval:>15} {sval:>15}")
+
     print("\n" + "="*70)
 
-def main():
+
+def create_comparison_visualization(salem_df, gresham_df, output_dir):
     """
-    Main analysis function
+    Create side-by-side comparison chart for Salem vs Gresham.
     """
-    print("="*70)
-    print("RMV vs. SALE PRICE ANALYSIS - GRESHAM AND SALEM, OREGON")
-    print("="*70)
-    
-    # Instructions for data access
-    print("\nDATA SOURCES:")
-    print("1. Salem (Marion County): Download from")
-    print("   https://apps.co.marion.or.us/AO/PropertySalesData/2025SalesData.csv")
-    print("   https://apps.co.marion.or.us/AO/PropertySalesData/2024SalesData.csv")
-    print("\n2. Gresham (Multnomah County): Individual property searches at")
-    print("   https://multcoproptax.com")
-    print("   (No bulk download available - would need web scraping)")
-    
-    print("\n" + "="*70)
-    print("\nTo run this analysis:")
-    print("1. Download the Marion County data files")
-    print("2. Update the file paths below")
-    print("3. Inspect the CSV columns and update column names as needed")
-    print("4. Run the script")
-    print("\n" + "="*70)
-    
-    # Example usage (uncomment and modify when data is available):
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('Salem vs. Gresham: RMV Assessment Accuracy Comparison',
+                 fontsize=16, fontweight='bold')
+
+    # 1. Overlaid scatter plots
+    ax1 = axes[0, 0]
+    ax1.scatter(salem_df['RMV'], salem_df['SalePrice'], alpha=0.3, s=15,
+                color='tab:blue', label='Salem')
+    ax1.scatter(gresham_df['RMV'], gresham_df['SalePrice'], alpha=0.4, s=15,
+                color='tab:orange', label='Gresham')
+    lims = [
+        min(salem_df['RMV'].min(), gresham_df['RMV'].min()),
+        max(salem_df['RMV'].max(), gresham_df['RMV'].max()),
+    ]
+    ax1.plot(lims, lims, 'g--', linewidth=2, label='Perfect (y=x)')
+    ax1.set_xlabel('County RMV ($)')
+    ax1.set_ylabel('Sale Price ($)')
+    ax1.set_title('RMV vs. Sale Price')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 2. Overlaid percent difference distributions
+    ax2 = axes[0, 1]
+    bins = np.linspace(-50, 100, 60)
+    ax2.hist(salem_df['Percent_Difference'].clip(-50, 100), bins=bins, alpha=0.5,
+             color='tab:blue', label='Salem', density=True)
+    ax2.hist(gresham_df['Percent_Difference'].clip(-50, 100), bins=bins, alpha=0.5,
+             color='tab:orange', label='Gresham', density=True)
+    ax2.axvline(x=0, color='red', linestyle='--', linewidth=1.5)
+    ax2.set_xlabel('% Difference (Sale - RMV) / RMV')
+    ax2.set_ylabel('Density')
+    ax2.set_title('RMV Prediction Error Distribution')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # 3. Side-by-side box plots
+    ax3 = axes[1, 0]
+    ax3.boxplot([salem_df['Ratio'], gresham_df['Ratio']],
+                tick_labels=['Salem', 'Gresham'])
+    ax3.axhline(y=1.0, color='red', linestyle='--', linewidth=1.5, label='Perfect Match')
+    ax3.set_ylabel('Sale Price / RMV Ratio')
+    ax3.set_title('Ratio Distributions')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    # 4. Summary statistics text
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    s_stats, _ = calculate_statistics(salem_df.copy())
+    g_stats, _ = calculate_statistics(gresham_df.copy())
+    rows = [
+        ['Metric', 'Salem', 'Gresham'],
+        ['N sales', f"{s_stats['Count']:,}", f"{g_stats['Count']:,}"],
+        ['Correlation (r)', f"{s_stats['Correlation']:.3f}", f"{g_stats['Correlation']:.3f}"],
+        ['R-squared', f"{s_stats['R_Squared']:.3f}", f"{g_stats['R_Squared']:.3f}"],
+        ['Median % Diff', f"{s_stats['Median_Percent_Diff']:.1f}%", f"{g_stats['Median_Percent_Diff']:.1f}%"],
+        ['Mean Ratio', f"{s_stats['Mean_Ratio']:.3f}", f"{g_stats['Mean_Ratio']:.3f}"],
+        ['Reg. Slope', f"{s_stats['Regression_Slope']:.3f}", f"{g_stats['Regression_Slope']:.3f}"],
+    ]
+    table = ax4.table(cellText=rows[1:], colLabels=rows[0], loc='center',
+                      cellLoc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1, 1.5)
+    ax4.set_title('Summary Comparison', fontsize=14)
+
+    plt.tight_layout()
+    fig_path = os.path.join(output_dir, 'gresham_vs_salem_comparison.png')
+    fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+    print(f"Comparison visualization saved: {fig_path}")
+    return fig
+
+def apply_property_filters(df, min_price=None, max_price=None,
+                           min_acres=None, min_baths=None, label=''):
     """
-    # Load Salem data
-    salem_df = load_marion_county_data('marion_2024_sales.csv')
-    salem_recent = filter_recent_sales(salem_df, months=12)
-    salem_clean = clean_sales_data(salem_recent, city_filter='SALEM')
-    
-    salem_stats, salem_df_analyzed = calculate_statistics(salem_clean)
+    Apply property filters to match comparable criteria across cities.
+    Works with both Salem (sales CSV columns) and Gresham (research DB columns).
+    """
+    before = len(df)
+    filters_desc = []
+
+    if min_price is not None or max_price is not None:
+        lo = min_price or 0
+        hi = max_price or float('inf')
+        df = df[(df['SalePrice'] >= lo) & (df['SalePrice'] <= hi)]
+        filters_desc.append(f"price ${lo:,.0f}-${hi:,.0f}")
+
+    if min_acres is not None:
+        # Salem: 'Total Fragment (Land) Acres', Gresham: not available (skip)
+        if 'Total Fragment (Land) Acres' in df.columns:
+            acres = pd.to_numeric(df['Total Fragment (Land) Acres'], errors='coerce')
+            df = df[acres >= min_acres]
+            filters_desc.append(f"lot >= {min_acres} acres")
+
+    if min_baths is not None:
+        # Salem has separate Bathrooms + Half Bathrooms columns
+        if 'Bathrooms' in df.columns:
+            full = pd.to_numeric(df['Bathrooms'], errors='coerce').fillna(0)
+            half = pd.to_numeric(df.get('Half Bathrooms', 0), errors='coerce').fillna(0)
+            total_baths = full + half * 0.5
+            df = df[total_baths >= min_baths]
+            filters_desc.append(f"baths >= {min_baths}")
+
+    if filters_desc:
+        desc = ', '.join(filters_desc)
+        print(f"  Property filter ({desc}): {before} -> {len(df)}")
+
+    return df
+
+
+def run_salem_analysis(base_dir, figures_dir, reports_dir, property_filters=None):
+    """Load Salem data, run analysis, return (stats, analyzed_df)."""
+    orcats_file = os.path.join(base_dir, 'data', 'raw', 'comprehensive', 'ORCATS999_(NEW).csv')
+    sales_2024 = os.path.join(base_dir, 'data', 'raw', '2024SalesData.csv')
+    sales_2025 = os.path.join(base_dir, 'data', 'raw', '2025SalesData.csv')
+
+    print("=" * 70)
+    print("RMV vs. SALE PRICE ANALYSIS - SALEM, OREGON")
+    print("Data: Marion County sales (2024-2025) + ORCATS999 assessments")
+    print("Filter: Confirmed arms-length sales only (Condition Code 33)")
+    print("=" * 70)
+
+    print("\n--- Loading assessment data ---")
+    orcats_df = load_orcats_data(orcats_file)
+
+    print("\n--- Loading sales data ---")
+    sales_df = load_sales_data(sales_2024, sales_2025)
+
+    salem_df = prepare_salem_data(orcats_df, sales_df)
+
+    if property_filters:
+        salem_df = apply_property_filters(salem_df, **property_filters)
+
+    if len(salem_df) < 30:
+        print(f"\nWARNING: Only {len(salem_df)} records. Minimum 30 recommended.")
+        if len(salem_df) == 0:
+            return None, None
+
+    salem_stats, salem_analyzed = calculate_statistics(salem_df)
     print_analysis_report('SALEM', salem_stats)
-    
-    fig1 = create_visualizations(salem_df_analyzed, 'Salem')
-    plt.savefig('salem_analysis.png', dpi=300, bbox_inches='tight')
-    
-    # Save detailed results
-    salem_df_analyzed.to_csv('salem_analysis_results.csv', index=False)
-    
-    # Similar process for Gresham once data is obtained
-    # ...
-    
-    plt.show()
-    """
+
+    fig = create_visualizations(salem_analyzed, 'Salem')
+    fig_path = os.path.join(figures_dir, 'salem_rmv_vs_sale_price.png')
+    fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+    print(f"\nVisualization saved: {fig_path}")
+
+    output_cols = ['Account Number', 'Situs Address', 'SaleDate', 'SalePrice',
+                   'RMVLAND', 'RMVIMPR', 'RMV', 'AV',
+                   'Difference', 'Percent_Difference', 'Ratio']
+    output_cols = [c for c in output_cols if c in salem_analyzed.columns]
+    results_path = os.path.join(reports_dir, 'salem_analysis_results.csv')
+    salem_analyzed[output_cols].to_csv(results_path, index=False)
+    print(f"Detailed results saved: {results_path}")
+
+    return salem_stats, salem_analyzed
+
+
+def run_gresham_analysis(base_dir, figures_dir, reports_dir,
+                         exclude_new_construction=False):
+    """Load Gresham data, run analysis, return (stats, analyzed_df)."""
+    gresham_db = os.path.join(base_dir, 'data', 'gresham', 'gresham_research_db.csv')
+
+    if not os.path.exists(gresham_db):
+        print("\nGresham research database not found.")
+        print("Run 'python gresham_data_collector.py ingest <redfin.csv>' first.")
+        return None, None
+
+    print("\n" + "=" * 70)
+    print("RMV vs. SALE PRICE ANALYSIS - GRESHAM, OREGON")
+    print("Data: Redfin sales + Multnomah County ArcGIS assessments")
+    if exclude_new_construction:
+        print("Filter: Excluding new construction (built 2024+)")
+    print("=" * 70)
+
+    gresham_df = load_gresham_data(gresham_db,
+                                   exclude_new_construction=exclude_new_construction)
+
+    if len(gresham_df) < 30:
+        print(f"\nWARNING: Only {len(gresham_df)} records. Minimum 30 recommended.")
+        if len(gresham_df) == 0:
+            return None, None
+
+    gresham_stats, gresham_analyzed = calculate_statistics(gresham_df)
+    print_analysis_report('GRESHAM', gresham_stats)
+
+    fig = create_visualizations(gresham_analyzed, 'Gresham')
+    fig_path = os.path.join(figures_dir, 'gresham_rmv_vs_sale_price.png')
+    fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+    print(f"\nVisualization saved: {fig_path}")
+
+    output_cols = ['PropertyID', 'Address', 'SaleDate', 'SalePrice',
+                   'RMVLAND', 'RMVIMPR', 'RMV',
+                   'Difference', 'Percent_Difference', 'Ratio']
+    output_cols = [c for c in output_cols if c in gresham_analyzed.columns]
+    results_path = os.path.join(reports_dir, 'gresham_analysis_results.csv')
+    gresham_analyzed[output_cols].to_csv(results_path, index=False)
+    print(f"Detailed results saved: {results_path}")
+
+    return gresham_stats, gresham_analyzed
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='Analyze how well county-assessed Real Market Values (RMV) '
+                    'predict actual home sale prices in Salem and Gresham, Oregon.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  %(prog)s                                  Salem analysis (default)
+  %(prog)s --city gresham                   Gresham analysis
+  %(prog)s --city both                      Compare both cities
+  %(prog)s --city both --exclude-new        Exclude new construction from Gresham
+  %(prog)s --city both --match-gresham      Match Salem filters to Gresham criteria
+  %(prog)s --min-price 400000 --max-price 800000   Custom price range
+
+data setup:
+  Salem:   Automatic (uses data/raw/ CSVs + ORCATS999 assessment data)
+  Gresham: Run 'python gresham_data_collector.py ingest <redfin.csv>' first
+""")
+
+    parser.add_argument('--city', choices=['salem', 'gresham', 'both'],
+                        default='salem',
+                        help='which city to analyze (default: salem)')
+    parser.add_argument('--exclude-new', action='store_true',
+                        help='exclude new construction (built 2024+) from Gresham; '
+                             'these have land-only RMV before the home was completed')
+    parser.add_argument('--match-gresham', action='store_true',
+                        help='filter Salem to match Gresham Redfin search criteria '
+                             '($500K-$2M, 0.25 acre+, 2.5 bath+)')
+    parser.add_argument('--min-price', type=float, default=None, metavar='$',
+                        help='minimum sale price filter')
+    parser.add_argument('--max-price', type=float, default=None, metavar='$',
+                        help='maximum sale price filter')
+    parser.add_argument('--min-acres', type=float, default=None, metavar='N',
+                        help='minimum lot size in acres (Salem only)')
+    parser.add_argument('--min-baths', type=float, default=None, metavar='N',
+                        help='minimum total bathrooms, e.g. 2.5 (Salem only)')
+    args = parser.parse_args()
+
+    # Build property filters
+    property_filters = {}
+    if args.match_gresham:
+        property_filters = {
+            'min_price': 500000, 'max_price': 2000000,
+            'min_acres': 0.25, 'min_baths': 2.5,
+        }
+        print("** Applying Gresham-matching filters: $500K-$2M, 0.25ac+, 2.5ba+ **\n")
+    else:
+        if args.min_price: property_filters['min_price'] = args.min_price
+        if args.max_price: property_filters['max_price'] = args.max_price
+        if args.min_acres: property_filters['min_acres'] = args.min_acres
+        if args.min_baths: property_filters['min_baths'] = args.min_baths
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    results_dir = os.path.join(base_dir, 'results')
+    figures_dir = os.path.join(results_dir, 'figures')
+    reports_dir = os.path.join(results_dir, 'reports')
+    for d in [results_dir, figures_dir, reports_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    salem_stats = salem_analyzed = None
+    gresham_stats = gresham_analyzed = None
+
+    if args.city in ('salem', 'both'):
+        salem_stats, salem_analyzed = run_salem_analysis(
+            base_dir, figures_dir, reports_dir,
+            property_filters=property_filters or None
+        )
+
+    if args.city in ('gresham', 'both'):
+        gresham_stats, gresham_analyzed = run_gresham_analysis(
+            base_dir, figures_dir, reports_dir,
+            exclude_new_construction=args.exclude_new
+        )
+
+    if args.city == 'both' and salem_stats and gresham_stats:
+        compare_cities(gresham_stats, salem_stats)
+        create_comparison_visualization(salem_analyzed, gresham_analyzed, figures_dir)
+
+    if os.environ.get('MPLBACKEND') != 'Agg':
+        plt.show()
 
 if __name__ == "__main__":
     main()
